@@ -13,6 +13,9 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "maxi3")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
+# Track processed message IDs to avoid duplicates
+processed_messages = set()
+
 
 async def send_whatsapp_message(to_number: str, message: str):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
@@ -46,7 +49,6 @@ async def process_text_message(from_number: str, text: str):
     """Process incoming text and reply."""
     txt = text.strip()
 
-    # Simple echo for now — replace with your logic later
     reply = f"Hola! Recibimos tu mensaje: \"{txt}\"\n\nFundastock WhatsApp Bot activo."
 
     await send_whatsapp_message(from_number, reply)
@@ -71,14 +73,31 @@ async def verify_webhook(
 async def receive_message(request: Request):
     try:
         body = await request.json()
-        logger.info(f"Webhook payload: {body}")
+        logger.info(f"FULL PAYLOAD: {body}")
 
         if body.get("object") == "whatsapp_business_account":
             for entry in body.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
 
+                    # Skip status updates (delivered, read, etc.)
+                    if "statuses" in value:
+                        logger.info("Skipping status update")
+                        continue
+
                     for message in value.get("messages", []):
+                        msg_id = message.get("id")
+
+                        # Skip already processed messages (Meta can send duplicates)
+                        if msg_id in processed_messages:
+                            logger.info(f"Skipping duplicate message {msg_id}")
+                            continue
+                        processed_messages.add(msg_id)
+
+                        # Keep set from growing forever
+                        if len(processed_messages) > 1000:
+                            processed_messages.clear()
+
                         from_number = message.get("from")
                         msg_type = message.get("type")
 
@@ -86,6 +105,8 @@ async def receive_message(request: Request):
                             text_body = message.get("text", {}).get("body", "")
                             logger.info(f"From {from_number}: {text_body}")
                             await process_text_message(from_number, text_body)
+                        else:
+                            logger.info(f"Ignoring message type: {msg_type}")
 
         return {"status": "ok"}
 
