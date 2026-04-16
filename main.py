@@ -240,23 +240,29 @@ async def send_whatsapp_image(to_number: str, image_url: str, caption: str = "")
 
 async def handle_cliente(from_number: str):
     """Send the customer a QR code with their available credit that can be scanned at the POS."""
+    logger.info(f"handle_cliente called from={from_number}")
+
+    # Look up linked rewards
+    rows = []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"{SUPABASE_URL}/rest/v1/qr_rewards",
                 headers=SUPA_HEADERS,
                 params={
-                    "select": "reward_amount,status",
+                    "select": "id,reward_amount,status,order_id",
                     "phone_number": f"eq.{from_number}",
                     "status": "eq.linked",
                 },
             )
-            rows = resp.json() if resp.status_code == 200 else []
+            logger.info(f"qr_rewards lookup → status={resp.status_code} body={resp.text[:300]}")
+            if resp.status_code == 200:
+                rows = resp.json()
     except Exception as e:
         logger.error(f"Error querying rewards: {e}")
-        rows = []
 
     total = round(sum(float(r.get("reward_amount", 0) or 0) for r in rows), 2)
+    logger.info(f"Total credit for {from_number}: ${total} ({len(rows)} rows)")
 
     if total <= 0:
         await send_whatsapp_message(
@@ -265,17 +271,33 @@ async def handle_cliente(from_number: str):
         )
         return
 
+    # Verify the QR image endpoint is reachable first
     qr_img_url = f"{MAIN_APP_URL}/api/customer-qr/{from_number}"
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            pre = await client.get(qr_img_url)
+            logger.info(f"QR preflight → status={pre.status_code} type={pre.headers.get('content-type','')}")
+            qr_ok = pre.status_code == 200 and "image" in pre.headers.get("content-type", "").lower()
+    except Exception as e:
+        logger.error(f"QR preflight error: {e}")
+        qr_ok = False
+
     caption = (
         f"🎟️ Tu credito disponible: ${total:0.2f}\n\n"
         f"Muestra este codigo al cajero en tu proxima compra para canjearlo."
     )
-    sent = await send_whatsapp_image(from_number, qr_img_url, caption)
-    if not sent:
-        await send_whatsapp_message(
-            from_number,
-            f"Tu credito: ${total:0.2f}\n\nAbre tu QR aqui: {qr_img_url}"
-        )
+
+    if qr_ok:
+        sent = await send_whatsapp_image(from_number, qr_img_url, caption)
+        if sent:
+            return
+        logger.warning("send_whatsapp_image returned False; falling back to text link")
+
+    # Fallback: send text with the link
+    await send_whatsapp_message(
+        from_number,
+        f"🎟️ Tu credito disponible: ${total:0.2f}\n\nAbre tu QR aqui (muestralo al cajero):\n{qr_img_url}"
+    )
 
 
 async def process_text_message(from_number: str, text: str):
