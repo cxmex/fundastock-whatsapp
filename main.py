@@ -56,11 +56,11 @@ async def send_whatsapp_message(to_number: str, message: str):
         return None
 
 
-async def send_whatsapp_document(to_number: str, doc_url: str, filename: str, caption: str = ""):
-    """Send a PDF (or other document) via WhatsApp using a public URL."""
+async def send_whatsapp_document(to_number: str, doc_url: str, filename: str, caption: str = "") -> bool:
+    """Send a PDF via WhatsApp using a public URL. Returns True on success."""
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error("Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID")
-        return None
+        return False
 
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -81,12 +81,32 @@ async def send_whatsapp_document(to_number: str, doc_url: str, filename: str, ca
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            logger.info(f"Sent document to {to_number}: {doc_url}")
-            return resp.json()
+            logger.info(f"Document send → status={resp.status_code} body={resp.text[:400]}")
+            if resp.status_code >= 400:
+                return False
+            return True
     except Exception as e:
-        logger.error(f"Error sending document: {e} :: {getattr(e, 'response', None) and e.response.text}")
-        return None
+        logger.error(f"Exception sending document: {e}")
+        return False
+
+
+async def preflight_pdf(url: str) -> tuple[bool, str]:
+    """Verify the PDF URL is publicly reachable and returns a PDF before asking WhatsApp to fetch it."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url)
+            ctype = resp.headers.get("content-type", "")
+            size = len(resp.content)
+            logger.info(f"PDF preflight → status={resp.status_code} type={ctype} size={size}")
+            if resp.status_code != 200:
+                return False, f"HTTP {resp.status_code}"
+            if "pdf" not in ctype.lower():
+                return False, f"Content-Type={ctype}"
+            if size < 200:
+                return False, f"Too small ({size}B)"
+            return True, "OK"
+    except Exception as e:
+        return False, str(e)
 
 
 async def handle_canjear(from_number: str, token: str):
@@ -165,12 +185,27 @@ async def handle_canjear(from_number: str, token: str):
 
         # Send ticket PDF
         pdf_url = f"{MAIN_APP_URL}/api/ticket-pdf/{token}"
-        await send_whatsapp_document(
+        ok, reason = await preflight_pdf(pdf_url)
+        if not ok:
+            logger.error(f"PDF preflight FAILED: {reason} — url={pdf_url}")
+            await send_whatsapp_message(
+                from_number,
+                f"No pudimos generar tu ticket ahora mismo. Intenta abrirlo aqui:\n{pdf_url}"
+            )
+            return
+
+        sent = await send_whatsapp_document(
             from_number,
             pdf_url,
             filename=f"ticket_{order_id}.pdf",
             caption=f"Tu ticket #{order_id}",
         )
+        if not sent:
+            logger.warning("Document send failed — falling back to text link")
+            await send_whatsapp_message(
+                from_number,
+                f"Descarga tu ticket aqui:\n{pdf_url}"
+            )
 
     except Exception as e:
         logger.error(f"Error in handle_canjear: {e}")
