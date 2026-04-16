@@ -559,51 +559,88 @@ def _safe_id(modelo_key: str) -> str:
 
 
 async def send_stock_for_modelo(from_number: str, modelo_key: str):
-    """Look up stock for a 'MARCA | MODELO' key and send a text reply."""
+    """Look up LIVE stock for a 'MARCA | MODELO' key from inventario1 and send a text reply.
+    Sums terex1 + terex2 across all barcodes (colors) for the modelo.
+    """
     parts = modelo_key.split("|", 1) if "|" in modelo_key else modelo_key.split(" ", 1)
     marca = parts[0].strip() if len(parts) >= 1 else ""
     modelo = parts[1].strip() if len(parts) == 2 else modelo_key
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            params = {
-                "select": "marca,modelo,black,blue,red,tot_terex1",
-                "modelo": f"eq.{modelo}",
-                "limit": "1",
-            }
-            if marca:
-                params["marca"] = f"eq.{marca}"
+            # Pull every barcode for this modelo from inventario1 (live stock)
             resp = await client.get(
-                f"{SUPABASE_URL}/rest/v1/inventario_modelos",
-                headers=SUPA_HEADERS,
-                params=params,
+                f"{SUPABASE_URL}/rest/v1/inventario1",
+                headers={**SUPA_HEADERS, "Range": "0-499"},
+                params={
+                    "select": "barcode,color_id,terex1,terex2,name",
+                    "modelo": f"eq.{modelo}",
+                    "limit": "500",
+                },
             )
-            rows = resp.json() if resp.status_code == 200 else []
+            inv_rows = resp.json() if resp.status_code == 200 else []
     except Exception as e:
-        logger.error(f"stock lookup error: {e}")
-        rows = []
+        logger.error(f"inventario1 lookup error: {e}")
+        inv_rows = []
 
-    if not rows:
+    if not inv_rows:
         await send_whatsapp_message(from_number, f"No encontramos stock de *{modelo}*.")
         return
 
-    r = rows[0]
-    total = r.get("tot_terex1", 0) or 0
-    parts_msg = [f"📱 *{r.get('marca','')} {r.get('modelo','')}*",
-                 f"Stock total: *{total}* piezas"]
+    # Aggregate by color
+    total_t1 = 0
+    total_t2 = 0
+    by_color_id: dict[int, dict] = {}
+    for r in inv_rows:
+        t1 = int(r.get("terex1") or 0)
+        t2 = int(r.get("terex2") or 0)
+        total_t1 += t1
+        total_t2 += t2
+        cid = r.get("color_id")
+        if cid is None:
+            continue
+        cur = by_color_id.setdefault(cid, {"t1": 0, "t2": 0})
+        cur["t1"] += t1
+        cur["t2"] += t2
 
-    # Mention colors that have a barcode configured (stock exists in inventario1)
-    color_hints = []
-    if r.get("black"):
-        color_hints.append("Negro")
-    if r.get("blue"):
-        color_hints.append("Azul")
-    if r.get("red"):
-        color_hints.append("Rojo")
-    if color_hints:
-        parts_msg.append("Colores: " + ", ".join(color_hints))
+    # Resolve color names
+    color_names: dict[int, str] = {}
+    if by_color_id:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                ids = ",".join(str(c) for c in by_color_id.keys())
+                cresp = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/inventario_colores",
+                    headers=SUPA_HEADERS,
+                    params={"select": "id,color", "id": f"in.({ids})"},
+                )
+                if cresp.status_code == 200:
+                    for c in cresp.json():
+                        color_names[c["id"]] = c.get("color", "")
+        except Exception:
+            pass
 
-    await send_whatsapp_message(from_number, "\n".join(parts_msg))
+    lines = [f"📱 *{marca} {modelo}*" if marca else f"📱 *{modelo}*"]
+    total_all = total_t1 + total_t2
+    lines.append(f"Stock total: *{total_all}* piezas  (T1: {total_t1} · T2: {total_t2})")
+
+    # Per-color breakdown (only where stock > 0)
+    color_lines = []
+    for cid, v in sorted(by_color_id.items(), key=lambda kv: -(kv[1]["t1"] + kv[1]["t2"])):
+        total = v["t1"] + v["t2"]
+        if total <= 0:
+            continue
+        name = color_names.get(cid, f"Color {cid}")
+        color_lines.append(f"• {name}: {total}  (T1: {v['t1']} · T2: {v['t2']})")
+
+    if color_lines:
+        lines.append("")
+        lines.append("*Por color:*")
+        lines.extend(color_lines[:12])
+    elif total_all == 0:
+        lines.append("\n⚠️ Sin stock en este momento.")
+
+    await send_whatsapp_message(from_number, "\n".join(lines))
 
 
 async def handle_free_query(from_number: str, text: str):
