@@ -271,33 +271,87 @@ async def handle_cliente(from_number: str):
         )
         return
 
-    # Verify the QR image endpoint is reachable first
-    qr_img_url = f"{MAIN_APP_URL}/api/customer-qr/{from_number}"
+    # Send a Code128 BARCODE (not a QR) because POS readers only read linear barcodes
+    img_url = f"{MAIN_APP_URL}/api/customer-barcode/{from_number}"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            pre = await client.get(qr_img_url)
-            logger.info(f"QR preflight → status={pre.status_code} type={pre.headers.get('content-type','')}")
-            qr_ok = pre.status_code == 200 and "image" in pre.headers.get("content-type", "").lower()
+            pre = await client.get(img_url)
+            logger.info(f"Barcode preflight → status={pre.status_code} type={pre.headers.get('content-type','')}")
+            img_ok = pre.status_code == 200 and "image" in pre.headers.get("content-type", "").lower()
     except Exception as e:
-        logger.error(f"QR preflight error: {e}")
-        qr_ok = False
+        logger.error(f"Barcode preflight error: {e}")
+        img_ok = False
 
     caption = (
         f"🎟️ Tu credito disponible: ${total:0.2f}\n\n"
-        f"Muestra este codigo al cajero en tu proxima compra para canjearlo."
+        f"Muestra este codigo de barras al cajero en tu proxima compra para canjearlo."
     )
 
-    if qr_ok:
-        sent = await send_whatsapp_image(from_number, qr_img_url, caption)
+    if img_ok:
+        sent = await send_whatsapp_image(from_number, img_url, caption)
         if sent:
             return
         logger.warning("send_whatsapp_image returned False; falling back to text link")
 
-    # Fallback: send text with the link
     await send_whatsapp_message(
         from_number,
-        f"🎟️ Tu credito disponible: ${total:0.2f}\n\nAbre tu QR aqui (muestralo al cajero):\n{qr_img_url}"
+        f"🎟️ Tu credito disponible: ${total:0.2f}\n\nAbre tu codigo aqui (muestralo al cajero):\n{img_url}"
     )
+
+
+async def handle_compras(from_number: str):
+    """Send the customer a summary of all their purchases with status (pendiente/canjeado)."""
+    logger.info(f"handle_compras called from={from_number}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{MAIN_APP_URL}/api/customer-compras/{from_number}",
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.error(f"compras endpoint error: {resp.status_code} {resp.text}")
+                await send_whatsapp_message(from_number, "No se pudo consultar tu historial. Intenta de nuevo.")
+                return
+            data = resp.json()
+    except Exception as e:
+        logger.error(f"Error fetching compras: {e}")
+        await send_whatsapp_message(from_number, "Error consultando historial.")
+        return
+
+    tickets = data.get("tickets", [])
+    totals = data.get("totals", {})
+
+    if not tickets:
+        await send_whatsapp_message(
+            from_number,
+            "Aun no tienes compras registradas.\n\nEscanea el QR de tus tickets para empezar a acumular tu 1% de credito."
+        )
+        return
+
+    lines = ["📋 *Historial de compras*", ""]
+    # Show up to 20 most recent
+    for t in tickets[:20]:
+        order_id = t.get("order_id", "")
+        amount = t.get("purchase_amount", 0)
+        reward = t.get("reward_amount", 0)
+        estado = t.get("estado", "pendiente")
+        emoji = "✅" if estado == "canjeado" else "🕒"
+        lines.append(f"{emoji} Ticket #{order_id}")
+        lines.append(f"   Compra: ${amount:0.2f}  |  Credito: ${reward:0.2f}")
+        lines.append(f"   Estado: *{estado}*")
+        lines.append("")
+
+    if len(tickets) > 20:
+        lines.append(f"...y {len(tickets) - 20} mas.")
+        lines.append("")
+
+    lines.append(f"💰 *Credito pendiente:* ${totals.get('pendiente', 0):0.2f}")
+    lines.append(f"✅ *Credito canjeado:* ${totals.get('canjeado', 0):0.2f}")
+    lines.append("")
+    lines.append("Escribe *CLIENTE* para obtener tu codigo de canje.")
+
+    await send_whatsapp_message(from_number, "\n".join(lines))
 
 
 async def process_text_message(from_number: str, text: str):
@@ -314,9 +368,15 @@ async def process_text_message(from_number: str, text: str):
         await handle_cliente(from_number)
         return
 
+    if upper == "COMPRAS":
+        await handle_compras(from_number)
+        return
+
     # Default echo
     reply = (
-        f"Hola! Escribe *CLIENTE* para ver tu credito disponible.\n\n"
+        f"Hola!\n\n"
+        f"Escribe *CLIENTE* para obtener tu codigo de canje.\n"
+        f"Escribe *COMPRAS* para ver tu historial de tickets.\n\n"
         f"Mensaje recibido: \"{txt}\""
     )
     await send_whatsapp_message(from_number, reply)
