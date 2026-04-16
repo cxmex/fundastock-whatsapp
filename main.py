@@ -558,39 +558,119 @@ def _safe_id(modelo_key: str) -> str:
     return ("STOCK:" + modelo_key.replace(" | ", "|"))[:256]
 
 
+async def _fetch_inventario(modelo: str, estilo: str | None = None) -> list[dict]:
+    """Fetch live rows from inventario1 for a modelo (optionally filtered by estilo)."""
+    params = {
+        "select": "barcode,color_id,estilo,estilo_id,terex1,terex2,name",
+        "modelo": f"eq.{modelo}",
+        "limit": "1000",
+    }
+    if estilo:
+        params["estilo"] = f"eq.{estilo}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/inventario1",
+                headers={**SUPA_HEADERS, "Range": "0-999"},
+                params=params,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.error(f"_fetch_inventario error: {e}")
+    return []
+
+
+async def _resolve_color_names(color_ids: list[int]) -> dict[int, str]:
+    if not color_ids:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            ids = ",".join(str(c) for c in color_ids)
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/inventario_colores",
+                headers=SUPA_HEADERS,
+                params={"select": "id,color", "id": f"in.({ids})"},
+            )
+            if resp.status_code == 200:
+                return {c["id"]: (c.get("color") or "") for c in resp.json()}
+    except Exception:
+        pass
+    return {}
+
+
 async def send_stock_for_modelo(from_number: str, modelo_key: str):
-    """Look up LIVE stock for a 'MARCA | MODELO' key from inventario1 and send a text reply.
-    Sums terex1 + terex2 across all barcodes (colors) for the modelo.
-    """
+    """Step 1 of 3: show total stock + list of estilos with positive stock (picker)."""
     parts = modelo_key.split("|", 1) if "|" in modelo_key else modelo_key.split(" ", 1)
     marca = parts[0].strip() if len(parts) >= 1 else ""
     modelo = parts[1].strip() if len(parts) == 2 else modelo_key
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Pull every barcode for this modelo from inventario1 (live stock)
-            resp = await client.get(
-                f"{SUPABASE_URL}/rest/v1/inventario1",
-                headers={**SUPA_HEADERS, "Range": "0-499"},
-                params={
-                    "select": "barcode,color_id,terex1,terex2,name",
-                    "modelo": f"eq.{modelo}",
-                    "limit": "500",
-                },
-            )
-            inv_rows = resp.json() if resp.status_code == 200 else []
-    except Exception as e:
-        logger.error(f"inventario1 lookup error: {e}")
-        inv_rows = []
-
+    inv_rows = await _fetch_inventario(modelo)
     if not inv_rows:
         await send_whatsapp_message(from_number, f"No encontramos stock de *{modelo}*.")
         return
 
-    # Aggregate by color
     total_t1 = 0
     total_t2 = 0
+    by_estilo: dict[str, dict] = {}
+    for r in inv_rows:
+        t1 = int(r.get("terex1") or 0)
+        t2 = int(r.get("terex2") or 0)
+        total_t1 += t1
+        total_t2 += t2
+        est = (r.get("estilo") or "").strip() or "Sin estilo"
+        cur = by_estilo.setdefault(est, {"t1": 0, "t2": 0})
+        cur["t1"] += t1
+        cur["t2"] += t2
+
+    total_all = total_t1 + total_t2
+
+    # Overview header
+    header = [
+        f"📱 *{marca} {modelo}*" if marca else f"📱 *{modelo}*",
+        f"Stock total: *{total_all}* piezas  (T1: {total_t1} · T2: {total_t2})",
+    ]
+
+    # Estilos with positive stock, sorted
+    estilos_pos = [
+        (name, v["t1"], v["t2"]) for name, v in by_estilo.items()
+        if (v["t1"] + v["t2"]) > 0
+    ]
+    estilos_pos.sort(key=lambda x: -(x[1] + x[2]))
+
+    if not estilos_pos:
+        header.append("\n⚠️ Sin stock en este momento.")
+        await send_whatsapp_message(from_number, "\n".join(header))
+        return
+
+    header.append(f"\nTenemos *{len(estilos_pos)}* estilo(s) con stock:")
+    await send_whatsapp_message(from_number, "\n".join(header))
+
+    # Interactive picker for estilo
+    if len(estilos_pos) <= 3:
+        buttons = [
+            (f"ESTILO:{modelo}|{name}"[:256], f"{name[:14]} ({t1+t2})"[:20])
+            for name, t1, t2 in estilos_pos
+        ]
+        await send_whatsapp_buttons(from_number, "Elige un estilo para ver los colores:", buttons)
+    else:
+        rows = [
+            (f"ESTILO:{modelo}|{name}"[:200], f"{name[:18]} ({t1+t2})"[:24])
+            for name, t1, t2 in estilos_pos[:10]
+        ]
+        await send_whatsapp_list(from_number, "Elige un estilo:", "Ver estilos", rows)
+
+
+async def send_colors_for_estilo_modelo(from_number: str, modelo: str, estilo: str):
+    """Step 2: show colors (with T1/T2 breakdown) for a specific estilo+modelo."""
+    inv_rows = await _fetch_inventario(modelo, estilo=estilo)
+    if not inv_rows:
+        await send_whatsapp_message(from_number, f"Sin datos para *{estilo}* / {modelo}.")
+        return
+
     by_color_id: dict[int, dict] = {}
+    total_t1 = 0
+    total_t2 = 0
     for r in inv_rows:
         t1 = int(r.get("terex1") or 0)
         t2 = int(r.get("terex2") or 0)
@@ -603,42 +683,27 @@ async def send_stock_for_modelo(from_number: str, modelo_key: str):
         cur["t1"] += t1
         cur["t2"] += t2
 
-    # Resolve color names
-    color_names: dict[int, str] = {}
-    if by_color_id:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                ids = ",".join(str(c) for c in by_color_id.keys())
-                cresp = await client.get(
-                    f"{SUPABASE_URL}/rest/v1/inventario_colores",
-                    headers=SUPA_HEADERS,
-                    params={"select": "id,color", "id": f"in.({ids})"},
-                )
-                if cresp.status_code == 200:
-                    for c in cresp.json():
-                        color_names[c["id"]] = c.get("color", "")
-        except Exception:
-            pass
+    color_names = await _resolve_color_names(list(by_color_id.keys()))
 
-    lines = [f"📱 *{marca} {modelo}*" if marca else f"📱 *{modelo}*"]
-    total_all = total_t1 + total_t2
-    lines.append(f"Stock total: *{total_all}* piezas  (T1: {total_t1} · T2: {total_t2})")
-
-    # Per-color breakdown (only where stock > 0)
+    lines = [
+        f"🎨 *{estilo}*",
+        f"📱 {modelo}",
+        f"Subtotal: *{total_t1 + total_t2}* piezas  (T1: {total_t1} · T2: {total_t2})",
+        "",
+        "*Colores disponibles:*",
+    ]
     color_lines = []
     for cid, v in sorted(by_color_id.items(), key=lambda kv: -(kv[1]["t1"] + kv[1]["t2"])):
         total = v["t1"] + v["t2"]
         if total <= 0:
             continue
         name = color_names.get(cid, f"Color {cid}")
-        color_lines.append(f"• {name}: {total}  (T1: {v['t1']} · T2: {v['t2']})")
+        color_lines.append(f"• {name}: *{total}*  (T1: {v['t1']} · T2: {v['t2']})")
 
     if color_lines:
-        lines.append("")
-        lines.append("*Por color:*")
-        lines.extend(color_lines[:12])
-    elif total_all == 0:
-        lines.append("\n⚠️ Sin stock en este momento.")
+        lines.extend(color_lines[:20])
+    else:
+        lines.append("⚠️ Sin stock en este momento.")
 
     await send_whatsapp_message(from_number, "\n".join(lines))
 
@@ -775,6 +840,13 @@ async def receive_message(request: Request):
                             if reply_id.startswith("STOCK:"):
                                 modelo_key = reply_id[len("STOCK:"):]
                                 await send_stock_for_modelo(from_number, modelo_key)
+                            elif reply_id.startswith("ESTILO:"):
+                                payload = reply_id[len("ESTILO:"):]
+                                if "|" in payload:
+                                    modelo_name, estilo_name = payload.split("|", 1)
+                                    await send_colors_for_estilo_modelo(from_number, modelo_name, estilo_name)
+                                else:
+                                    await send_whatsapp_message(from_number, "Formato de seleccion invalido.")
                             else:
                                 await send_whatsapp_message(from_number, "Opcion no reconocida.")
 
