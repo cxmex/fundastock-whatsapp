@@ -271,8 +271,10 @@ async def handle_cliente(from_number: str):
         )
         return
 
-    # Send a Code128 BARCODE (not a QR) because POS readers only read linear barcodes
-    img_url = f"{MAIN_APP_URL}/api/customer-barcode/{from_number}"
+    # Send a Code128 BARCODE (not a QR) because POS readers only read linear barcodes.
+    # Append a timestamp query param so WhatsApp's media cache doesn't serve a stale image.
+    import time as _time
+    img_url = f"{MAIN_APP_URL}/api/customer-barcode/{from_number}?v={int(_time.time())}"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             pre = await client.get(img_url)
