@@ -599,6 +599,51 @@ async def _resolve_color_names(color_ids: list[int]) -> dict[int, str]:
     return {}
 
 
+async def _fetch_estilo_images(estilo_id: int, limit: int = 3) -> list[str]:
+    """Return up to `limit` public URLs from the images_estilos bucket for this estilo."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/list/images_estilos",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+                json={"prefix": f"{estilo_id}/", "limit": limit},
+            )
+            if resp.status_code == 200:
+                files = resp.json()
+                return [
+                    f"{SUPABASE_URL}/storage/v1/object/public/images_estilos/{estilo_id}/{f['name']}"
+                    for f in files if f.get("name") and f.get("id")
+                ][:limit]
+    except Exception as e:
+        logger.error(f"_fetch_estilo_images error: {e}")
+    return []
+
+
+async def _fetch_color_images_by_cid(estilo_id: int) -> dict[int, list[str]]:
+    """Return { color_id: [url, ...] } for images in the images-colores bucket (via image_uploads)."""
+    out: dict[int, list[str]] = {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/image_uploads",
+                headers=SUPA_HEADERS,
+                params={
+                    "select": "public_url,color_id",
+                    "estilo_id": f"eq.{estilo_id}",
+                    "limit": "200",
+                },
+            )
+            if resp.status_code == 200:
+                for row in resp.json():
+                    cid = row.get("color_id")
+                    url = row.get("public_url")
+                    if cid and url:
+                        out.setdefault(cid, []).append(url)
+    except Exception as e:
+        logger.error(f"_fetch_color_images_by_cid error: {e}")
+    return out
+
+
 async def send_stock_for_modelo(from_number: str, modelo_key: str):
     """Step 1 of 3: show total stock + list of estilos with positive stock (picker)."""
     parts = modelo_key.split("|", 1) if "|" in modelo_key else modelo_key.split(" ", 1)
@@ -662,12 +707,16 @@ async def send_stock_for_modelo(from_number: str, modelo_key: str):
 
 
 async def send_colors_for_estilo_modelo(from_number: str, modelo: str, estilo: str):
-    """Step 2: show colors (with T1/T2 breakdown) for a specific estilo+modelo."""
+    """Step 2: show colors for a specific estilo+modelo with images.
+    Sends: estilo image(s) + text breakdown + one image per color with stock.
+    """
     inv_rows = await _fetch_inventario(modelo, estilo=estilo)
     if not inv_rows:
         await send_whatsapp_message(from_number, f"Sin datos para *{estilo}* / {modelo}.")
         return
 
+    # Aggregate by color + find estilo_id
+    estilo_id = None
     by_color_id: dict[int, dict] = {}
     total_t1 = 0
     total_t2 = 0
@@ -676,6 +725,8 @@ async def send_colors_for_estilo_modelo(from_number: str, modelo: str, estilo: s
         t2 = int(r.get("terex2") or 0)
         total_t1 += t1
         total_t2 += t2
+        if estilo_id is None:
+            estilo_id = r.get("estilo_id")
         cid = r.get("color_id")
         if cid is None:
             continue
@@ -685,15 +736,26 @@ async def send_colors_for_estilo_modelo(from_number: str, modelo: str, estilo: s
 
     color_names = await _resolve_color_names(list(by_color_id.keys()))
 
+    # 1. Send estilo bucket image (if any)
+    if estilo_id:
+        estilo_imgs = await _fetch_estilo_images(int(estilo_id), limit=1)
+        if estilo_imgs:
+            await send_whatsapp_image(
+                from_number,
+                estilo_imgs[0],
+                caption=f"🎨 {estilo}\n📱 {modelo}",
+            )
+
+    # 2. Send text breakdown
     lines = [
-        f"🎨 *{estilo}*",
-        f"📱 {modelo}",
+        f"*{estilo}* / {modelo}",
         f"Subtotal: *{total_t1 + total_t2}* piezas  (T1: {total_t1} · T2: {total_t2})",
         "",
         "*Colores disponibles:*",
     ]
     color_lines = []
-    for cid, v in sorted(by_color_id.items(), key=lambda kv: -(kv[1]["t1"] + kv[1]["t2"])):
+    sorted_colors = sorted(by_color_id.items(), key=lambda kv: -(kv[1]["t1"] + kv[1]["t2"]))
+    for cid, v in sorted_colors:
         total = v["t1"] + v["t2"]
         if total <= 0:
             continue
@@ -706,6 +768,25 @@ async def send_colors_for_estilo_modelo(from_number: str, modelo: str, estilo: s
         lines.append("⚠️ Sin stock en este momento.")
 
     await send_whatsapp_message(from_number, "\n".join(lines))
+
+    # 3. Send color images (from image_uploads / images-colores bucket)
+    if estilo_id:
+        color_imgs_map = await _fetch_color_images_by_cid(int(estilo_id))
+        sent = 0
+        max_images = 5
+        for cid, v in sorted_colors:
+            if sent >= max_images:
+                break
+            total = v["t1"] + v["t2"]
+            if total <= 0:
+                continue
+            urls = color_imgs_map.get(cid, [])
+            if not urls:
+                continue
+            name = color_names.get(cid, f"Color {cid}")
+            caption = f"{name} — {total} piezas"
+            await send_whatsapp_image(from_number, urls[0], caption=caption)
+            sent += 1
 
 
 async def handle_free_query(from_number: str, text: str):
