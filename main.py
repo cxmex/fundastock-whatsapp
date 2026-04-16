@@ -158,7 +158,8 @@ async def handle_canjear(from_number: str, token: str):
                 await send_whatsapp_message(from_number, "Este credito ya fue usado en una compra.")
                 return
 
-            # Update: set phone_number, claimed_at, status='claimed'
+            # Update: set phone_number, claimed_at, status='linked'
+            # ('linked' = phone associated; 'redeemed' will happen when credit is used on a purchase)
             now_iso = datetime.utcnow().isoformat()
             update_resp = await client.patch(
                 f"{SUPABASE_URL}/rest/v1/qr_rewards",
@@ -167,7 +168,7 @@ async def handle_canjear(from_number: str, token: str):
                 json={
                     "phone_number": from_number,
                     "claimed_at": now_iso,
-                    "status": "claimed",
+                    "status": "linked",
                 },
             )
             if update_resp.status_code not in (200, 204):
@@ -212,17 +213,90 @@ async def handle_canjear(from_number: str, token: str):
         await send_whatsapp_message(from_number, "Error procesando tu codigo. Intenta de nuevo en un momento.")
 
 
+async def send_whatsapp_image(to_number: str, image_url: str, caption: str = "") -> bool:
+    """Send an image via WhatsApp using a public URL."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        return False
+    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "image",
+        "image": {"link": image_url, "caption": caption},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            logger.info(f"Image send → status={resp.status_code} body={resp.text[:400]}")
+            return resp.status_code < 400
+    except Exception as e:
+        logger.error(f"Exception sending image: {e}")
+        return False
+
+
+async def handle_cliente(from_number: str):
+    """Send the customer a QR code with their available credit that can be scanned at the POS."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/qr_rewards",
+                headers=SUPA_HEADERS,
+                params={
+                    "select": "reward_amount,status",
+                    "phone_number": f"eq.{from_number}",
+                    "status": "eq.linked",
+                },
+            )
+            rows = resp.json() if resp.status_code == 200 else []
+    except Exception as e:
+        logger.error(f"Error querying rewards: {e}")
+        rows = []
+
+    total = round(sum(float(r.get("reward_amount", 0) or 0) for r in rows), 2)
+
+    if total <= 0:
+        await send_whatsapp_message(
+            from_number,
+            "Aun no tienes creditos disponibles.\n\nEscanea el QR de tus tickets para acumular 1% en cada compra."
+        )
+        return
+
+    qr_img_url = f"{MAIN_APP_URL}/api/customer-qr/{from_number}"
+    caption = (
+        f"🎟️ Tu credito disponible: ${total:0.2f}\n\n"
+        f"Muestra este codigo al cajero en tu proxima compra para canjearlo."
+    )
+    sent = await send_whatsapp_image(from_number, qr_img_url, caption)
+    if not sent:
+        await send_whatsapp_message(
+            from_number,
+            f"Tu credito: ${total:0.2f}\n\nAbre tu QR aqui: {qr_img_url}"
+        )
+
+
 async def process_text_message(from_number: str, text: str):
     """Route incoming text to the right handler."""
     txt = text.strip()
+    upper = txt.upper()
 
-    if txt.upper().startswith("CANJEAR:"):
+    if upper.startswith("CANJEAR:"):
         token = txt.split(":", 1)[1]
         await handle_canjear(from_number, token)
         return
 
+    if upper == "CLIENTE":
+        await handle_cliente(from_number)
+        return
+
     # Default echo
-    reply = f"Hola! Recibimos tu mensaje: \"{txt}\"\n\nFundastock WhatsApp Bot activo."
+    reply = (
+        f"Hola! Escribe *CLIENTE* para ver tu credito disponible.\n\n"
+        f"Mensaje recibido: \"{txt}\""
+    )
     await send_whatsapp_message(from_number, reply)
 
 
