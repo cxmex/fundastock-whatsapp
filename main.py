@@ -41,7 +41,7 @@ async def log_message(direction: str, phone_number: str, message_type: str = Non
     """Insert a row into whatsapp_messages. Failures are non-fatal."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
+            resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/whatsapp_messages",
                 headers=SUPA_HEADERS,
                 json={
@@ -54,6 +54,8 @@ async def log_message(direction: str, phone_number: str, message_type: str = Non
                     "extra": extra or {},
                 },
             )
+            if resp.status_code >= 400:
+                logger.warning(f"log_message HTTP {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         logger.warning(f"log_message failed: {e}")
 
