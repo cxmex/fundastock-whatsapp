@@ -91,7 +91,36 @@ async def route_message(from_number: str, text: str, referral: dict | None = Non
         await run_sales_agent(from_number, text, conv_data)
         return True
 
-    # --- No active conversation, no referral → fall through to existing flows ---
+    # --- Detect sales/purchase intent from organic users ---
+    upper = text.upper()
+    SALES_KEYWORDS = [
+        "MAYOREO", "PRECIO MAYOREO", "PRECIOS MAYOREO", "PARA REVENDER",
+        "REVENDER", "TIENDITA", "VENDO POR CATALOGO", "PROVEEDOR",
+        "QUIERO COMPRAR", "COMO COMPRO", "COMO LE HAGO PARA COMPRAR",
+        "HACEN ENVIOS", "ENVIAN", "PRECIO DE", "CUANTO CUESTA",
+        "CUANTO SALE", "ME INTERESA", "QUIERO PEDIR", "QUIERO ORDENAR",
+        "LISTA DE PRECIOS", "CATALOGO DE PRECIOS",
+    ]
+    if any(kw in upper for kw in SALES_KEYWORDS):
+        # Detect wholesale vs retail hint
+        WHOLESALE_HINTS = ["MAYOREO", "REVENDER", "TIENDITA", "CATALOGO", "PROVEEDOR"]
+        lead_hint = "wholesale" if any(h in upper for h in WHOLESALE_HINTS) else "unknown"
+
+        conv_data = {
+            "lead_source": "organic",
+            "stage": "greeting",
+            "lead_type": lead_hint,
+            "captured_data": {},
+            "escalated": False,
+            "human_takeover": False,
+        }
+        await upsert_conversation(from_number, conv_data)
+        await log_message("in", from_number, message_type="text", text_body=text,
+                          command="SALES_AGENT_ORGANIC")
+        await run_sales_agent(from_number, text, conv_data)
+        return True
+
+    # --- No active conversation, no referral, no sales intent → fall through to existing flows ---
     return False
 
 
