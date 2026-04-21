@@ -1,15 +1,24 @@
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from datetime import datetime
+from dotenv import load_dotenv
 import os
 import json
 import logging
 import httpx
 
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Fundastock WhatsApp Bot")
+
+# Mount sales agent admin router (imported after app is created, at bottom of file)
+
+# --- Test mode: capture outbound messages instead of sending to WhatsApp ---
+_test_mode = False
+_test_responses: list[dict] = []
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "maxi3")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
@@ -61,6 +70,9 @@ async def log_message(direction: str, phone_number: str, message_type: str = Non
 
 
 async def send_whatsapp_message(to_number: str, message: str):
+    if _test_mode:
+        _test_responses.append({"type": "text", "body": message})
+        return {"status": "test"}
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error("Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID")
         return None
@@ -91,6 +103,9 @@ async def send_whatsapp_message(to_number: str, message: str):
 
 async def send_whatsapp_document(to_number: str, doc_url: str, filename: str, caption: str = "") -> bool:
     """Send a PDF via WhatsApp using a public URL. Returns True on success."""
+    if _test_mode:
+        _test_responses.append({"type": "document", "url": doc_url, "filename": filename, "caption": caption})
+        return True
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error("Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID")
         return False
@@ -249,6 +264,9 @@ async def handle_canjear(from_number: str, token: str):
 
 async def send_whatsapp_image(to_number: str, image_url: str, caption: str = "") -> bool:
     """Send an image via WhatsApp using a public URL."""
+    if _test_mode:
+        _test_responses.append({"type": "image", "url": image_url, "caption": caption})
+        return True
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         return False
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
@@ -395,6 +413,9 @@ async def handle_compras(from_number: str):
 
 async def send_whatsapp_buttons(to_number: str, body_text: str, buttons: list[tuple[str, str]]) -> bool:
     """Send interactive reply-buttons (max 3). buttons = [(id, title), ...]."""
+    if _test_mode:
+        _test_responses.append({"type": "buttons", "body": body_text, "buttons": [{"id": bid, "title": title} for bid, title in buttons[:3]]})
+        return True
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         return False
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
@@ -429,6 +450,9 @@ async def send_whatsapp_buttons(to_number: str, body_text: str, buttons: list[tu
 async def send_whatsapp_list(to_number: str, body_text: str, button_label: str,
                               items: list[tuple[str, str]]) -> bool:
     """Send interactive list message (up to 10 rows). items = [(id, title), ...]."""
+    if _test_mode:
+        _test_responses.append({"type": "list", "body": body_text, "button_label": button_label, "items": [{"id": rid, "title": title} for rid, title in items[:10]]})
+        return True
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         return False
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
@@ -845,6 +869,20 @@ async def process_text_message(from_number: str, text: str):
         await handle_compras(from_number)
         return
 
+    # Store hours / horario
+    horario_keywords = ["ABRE HOY", "ABREN HOY", "HORARIO", "ESTAN ABIERTOS", "A QUE HORA ABREN", "A QUE HORA CIERRAN"]
+    if any(kw in upper for kw in horario_keywords):
+        horario_msg = "Estamos abiertos de Lunes a Sabado de 10:30 am a 6:00 pm"
+        await log_message("in", from_number, message_type="text", text_body=txt, command="HORARIO")
+        await send_whatsapp_message(from_number, horario_msg)
+        return
+
+    # Sales agent routing (check for active conversation or referral)
+    from sales_agent.router import route_message as sales_route
+    handled = await sales_route(from_number, txt)
+    if handled:
+        return
+
     # Otherwise: free-text query → Claude RAG
     await log_message("in", from_number, message_type="text", text_body=txt, command="QUERY")
     await handle_free_query(from_number, txt)
@@ -897,10 +935,43 @@ async def receive_message(request: Request):
                         from_number = message.get("from")
                         msg_type = message.get("type")
 
+                        # Extract referral from Click-to-WhatsApp ads
+                        referral = message.get("referral")
+                        referral_context = None
+                        if referral:
+                            referral_context = {
+                                "source_id": referral.get("source_id"),
+                                "source_url": referral.get("source_url"),
+                                "headline": referral.get("headline"),
+                                "body": referral.get("body"),
+                                "source_type": referral.get("source_type"),
+                                "media_type": referral.get("media_type"),
+                            }
+                            logger.info(f"Ad referral from {from_number}: {referral_context}")
+
                         if msg_type == "text":
                             text_body = message.get("text", {}).get("body", "")
                             logger.info(f"From {from_number}: {text_body}")
-                            await process_text_message(from_number, text_body)
+                            if referral_context:
+                                # Ad lead — route through sales agent
+                                from sales_agent.router import route_message as sales_route
+                                await sales_route(from_number, text_body, referral=referral_context)
+                            else:
+                                await process_text_message(from_number, text_body)
+
+                        elif msg_type == "image":
+                            # Handle incoming images (comprobantes, etc.)
+                            image_data = message.get("image", {})
+                            image_id = image_data.get("id", "")
+                            image_caption = image_data.get("caption", "")
+                            logger.info(f"Image from {from_number}: id={image_id} caption={image_caption}")
+                            await log_message("in", from_number, message_type="image",
+                                              text_body=image_caption, message_id=msg_id,
+                                              extra={"image_id": image_id})
+                            from sales_agent.router import route_image as sales_route_image
+                            handled = await sales_route_image(from_number, image_id, image_caption)
+                            if not handled:
+                                logger.info(f"Image from {from_number} not handled by sales agent")
 
                         elif msg_type == "interactive":
                             interactive = message.get("interactive", {})
@@ -951,3 +1022,246 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+# ─── Test Page ───────────────────────────────────────────────────────────────
+
+TEST_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fundastock Bot Tester</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #0b141a; color: #e9edef; height: 100vh; display: flex; flex-direction: column; }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 65%; padding: 8px 12px; border-radius: 8px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { background: #005c4b; align-self: flex-end; }
+  .msg.bot { background: #202c33; align-self: flex-start; }
+  .msg.bot img { max-width: 260px; border-radius: 6px; margin-top: 4px; display: block; }
+  .msg.bot .btn-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .msg.bot .btn-row button { background: #00a884; color: #fff; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .msg.bot .btn-row button:hover { background: #00c49a; }
+  .msg.bot .doc-link { color: #53bdeb; text-decoration: underline; }
+  #controls { padding: 10px; background: #1a262d; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #controls select, #controls button { background: #2a3942; color: #e9edef; border: 1px solid #3a4a54; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+  #controls button { background: #00a884; border: none; cursor: pointer; color: #fff; }
+  #controls button:hover { background: #00c49a; }
+  #controls label { font-size: 12px; color: #8696a0; }
+  #bar { display: flex; padding: 10px; background: #202c33; gap: 8px; }
+  #bar input { flex: 1; padding: 10px; border-radius: 8px; border: none; background: #2a3942; color: #e9edef; font-size: 14px; outline: none; }
+  #bar button { background: #00a884; border: none; color: #fff; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+  .spinner { display: none; align-self: flex-start; color: #8696a0; font-size: 13px; padding: 6px 12px; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <label>Simulate ad referral:</label>
+  <select id="sim_referral">
+    <option value="">Organic message (no ad)</option>
+    <option value="fb_iphone17_retail">FB ad: iPhone 17 case (retail)</option>
+    <option value="fb_mayoreo_starter">FB ad: Mayoreo starter kit</option>
+    <option value="tiktok_variety_pack">TikTok ad: 3-pack variety</option>
+  </select>
+  <button onclick="simComprobante()">Simular foto comprobante</button>
+  <button onclick="resetConv()">Reset Conversation</button>
+</div>
+<div id="chat"></div>
+<div class="spinner" id="spin">Typing...</div>
+<div id="bar">
+  <input id="inp" placeholder="Type a message..." autocomplete="off" />
+  <button onclick="send()">Send</button>
+</div>
+<script>
+const chat = document.getElementById('chat');
+const inp = document.getElementById('inp');
+const spin = document.getElementById('spin');
+let firstMessage = true;
+inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+const FAKE_REFERRALS = {
+  fb_iphone17_retail: {
+    source_id: "test_fb_001", source_url: "https://fb.com/ads/test",
+    headline: "Funda estilo iPhone 17 - Envio gratis", body: "La mejor funda para tu iPhone. Desde $149.",
+    source_type: "ad", media_type: "image"
+  },
+  fb_mayoreo_starter: {
+    source_id: "test_fb_002", source_url: "https://fb.com/ads/test",
+    headline: "Vende fundas - Precio de mayoreo", body: "Mas de 1000 modelos. Minimo $1,000.",
+    source_type: "ad", media_type: "image"
+  },
+  tiktok_variety_pack: {
+    source_id: "test_tt_001", source_url: "https://tiktok.com/ads/test",
+    headline: "3 fundas por $399", body: "Elige tus modelos favoritos. Envio gratis CDMX.",
+    source_type: "tiktok_ad", media_type: "video"
+  }
+};
+
+function addMsg(html, cls) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.innerHTML = html;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+  return d;
+}
+
+function renderBot(r) {
+  if (r.type === 'text') {
+    addMsg(esc(r.body), 'bot');
+  } else if (r.type === 'image') {
+    addMsg('<img src="' + esc(r.url) + '"><br>' + esc(r.caption || ''), 'bot');
+  } else if (r.type === 'document') {
+    addMsg('<a class="doc-link" href="' + esc(r.url) + '" target="_blank">' + esc(r.filename) + '</a><br>' + esc(r.caption || ''), 'bot');
+  } else if (r.type === 'buttons') {
+    let html = esc(r.body) + '<div class="btn-row">';
+    r.buttons.forEach(b => { html += '<button onclick="sendBtn(\\'' + esc(b.id) + '\\',\\'' + esc(b.title) + '\\')">' + esc(b.title) + '</button>'; });
+    html += '</div>';
+    addMsg(html, 'bot');
+  } else if (r.type === 'list') {
+    let html = esc(r.body) + '<div class="btn-row">';
+    r.items.forEach(b => { html += '<button onclick="sendBtn(\\'' + esc(b.id) + '\\',\\'' + esc(b.title) + '\\')">' + esc(b.title) + '</button>'; });
+    html += '</div>';
+    addMsg(html, 'bot');
+  }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+async function send() {
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  addMsg(esc(text), 'user');
+  spin.style.display = 'block';
+
+  const payload = {text};
+
+  // Include referral on first message if selected
+  const refSel = document.getElementById('sim_referral').value;
+  if (firstMessage && refSel && FAKE_REFERRALS[refSel]) {
+    payload.referral = FAKE_REFERRALS[refSel];
+    addMsg('[Ad referral: ' + refSel + ']', 'bot');
+  }
+  firstMessage = false;
+
+  try {
+    const res = await fetch('/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    const data = await res.json();
+    data.responses.forEach(renderBot);
+  } catch(e) { addMsg('Error: ' + e.message, 'bot'); }
+  spin.style.display = 'none';
+}
+
+async function sendBtn(id, title) {
+  addMsg(esc(title), 'user');
+  spin.style.display = 'block';
+  try {
+    const res = await fetch('/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({button_id: id, button_title: title}) });
+    const data = await res.json();
+    data.responses.forEach(renderBot);
+  } catch(e) { addMsg('Error: ' + e.message, 'bot'); }
+  spin.style.display = 'none';
+}
+
+async function simComprobante() {
+  addMsg('[Simulating comprobante image]', 'user');
+  spin.style.display = 'block';
+  try {
+    const res = await fetch('/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({simulate_comprobante: true}) });
+    const data = await res.json();
+    data.responses.forEach(renderBot);
+  } catch(e) { addMsg('Error: ' + e.message, 'bot'); }
+  spin.style.display = 'none';
+}
+
+async function resetConv() {
+  firstMessage = true;
+  try {
+    await fetch('/test/reset', { method: 'POST' });
+  } catch(e) {}
+  chat.innerHTML = '';
+  addMsg('Conversation reset. Select a referral type and send your first message.', 'bot');
+}
+</script>
+</body>
+</html>
+"""
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    return TEST_HTML
+
+@app.post("/test")
+async def test_send(request: Request):
+    global _test_mode, _test_responses
+    body = await request.json()
+    text = body.get("text", "")
+    button_id = body.get("button_id", "")
+    button_title = body.get("button_title", "")
+    referral = body.get("referral")
+    simulate_comprobante = body.get("simulate_comprobante", False)
+
+    _test_mode = True
+    _test_responses = []
+    fake_number = "5215500000000"
+
+    try:
+        if simulate_comprobante:
+            # Simulate a comprobante image being sent
+            from sales_agent.router import route_message as sales_route
+            handled = await sales_route(fake_number, "[El usuario envió foto de comprobante]")
+            if not handled:
+                _test_responses.append({"type": "text", "body": "No active sales conversation for comprobante simulation."})
+        elif button_id:
+            # Simulate interactive reply
+            if button_id.startswith("STOCK:"):
+                modelo_key = button_id[len("STOCK:"):]
+                await send_stock_for_modelo(fake_number, modelo_key)
+            elif button_id.startswith("ESTILO:"):
+                parts = button_id[len("ESTILO:"):].split("|", 1)
+                if len(parts) == 2:
+                    await send_colors_for_estilo_modelo(fake_number, parts[0], parts[1])
+            else:
+                await send_whatsapp_message(fake_number, f"Unknown button: {button_id}")
+        elif text:
+            if referral:
+                # Route through sales agent with ad referral
+                from sales_agent.router import route_message as sales_route
+                await sales_route(fake_number, text, referral=referral)
+            else:
+                await process_text_message(fake_number, text)
+    except Exception as e:
+        logger.error(f"Test error: {e}")
+        _test_responses.append({"type": "text", "body": f"Error: {e}"})
+    finally:
+        _test_mode = False
+
+    return JSONResponse({"responses": _test_responses})
+
+
+@app.post("/test/reset")
+async def test_reset():
+    """Reset the test conversation state."""
+    fake_number = "5215500000000"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/whatsapp_conversations",
+                headers=SUPA_HEADERS,
+                params={"phone_number": f"eq.{fake_number}"},
+            )
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/sales_conversation_turns",
+                headers=SUPA_HEADERS,
+                params={"phone_number": f"eq.{fake_number}"},
+            )
+    except Exception as e:
+        logger.warning(f"Test reset error: {e}")
+    return {"ok": True}
+
+
+# --- Mount sales agent admin router ---
+from sales_agent.admin import router as admin_router
+app.include_router(admin_router)
