@@ -1066,6 +1066,7 @@ TEST_HTML = """
   </select>
   <button onclick="simComprobante()">Simular foto comprobante</button>
   <button onclick="resetConv()">Reset Conversation</button>
+  <a href="/admin/dashboard" style="color:#53bdeb;font-size:13px;margin-left:auto">Admin Dashboard →</a>
 </div>
 <div id="chat"></div>
 <div class="spinner" id="spin">Typing...</div>
@@ -1265,3 +1266,7 @@ async def test_reset():
 # --- Mount sales agent admin router ---
 from sales_agent.admin import router as admin_router
 app.include_router(admin_router)
+
+# --- Mount analytics dashboard router ---
+from sales_agent.dashboard.routes import router as dashboard_router
+app.include_router(dashboard_router)
