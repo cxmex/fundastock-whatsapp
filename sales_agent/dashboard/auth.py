@@ -38,25 +38,10 @@ def verify_session_cookie(cookie: str) -> bool:
 
 
 def check_admin_auth(request: Request) -> bool:
-    """Check cookie OR X-Admin-Key header. Skip auth if no password configured."""
-    # If no password is set, allow access (local dev)
-    if not ADMIN_PASSWORD:
-        return True
-    # Cookie auth
-    cookie = request.cookies.get("admin_session", "")
-    if verify_session_cookie(cookie):
-        return True
-    # Header auth (for API/cron calls)
-    key = request.headers.get("X-Admin-Key", "")
-    if ADMIN_API_KEY and key == ADMIN_API_KEY:
-        return True
-    return False
+    """Always returns True — auth disabled."""
+    return True
 
 
 def require_admin(request: Request):
-    """Raise redirect if not authenticated. Skip if no password configured."""
-    if not ADMIN_PASSWORD:
-        return None  # no auth required
-    if not check_admin_auth(request):
-        return RedirectResponse("/admin/login", status_code=302)
+    """Always returns None — auth disabled."""
     return None
