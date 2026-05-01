@@ -884,6 +884,9 @@ async def process_text_message(from_number: str, text: str):
         "me interesa! tienen disponible",
         "me interesa tienen disponible",
         "hola, me interesa",
+        "vi su catalogo",                    # landing page default WA message
+        "vi su catálogo",                     # accent variant
+        "vi el catalogo",
     )
     lower_txt = txt.lower()
     is_fb_cta = any(tok in lower_txt for tok in FB_CTA_TOKENS)
