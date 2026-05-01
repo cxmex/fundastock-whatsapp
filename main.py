@@ -877,8 +877,33 @@ async def process_text_message(from_number: str, text: str):
         await send_whatsapp_message(from_number, horario_msg)
         return
 
-    # Sales agent routing (check for active conversation or referral)
+    # FB Click-to-WhatsApp ad CTA detection — Meta sometimes drops the `referral`
+    # field on these messages, so detect the prefilled CTA text and inject a
+    # synthetic referral so the sales agent fires.
+    FB_CTA_TOKENS = (
+        "me interesa! tienen disponible",
+        "me interesa tienen disponible",
+        "hola, me interesa",
+    )
+    lower_txt = txt.lower()
+    is_fb_cta = any(tok in lower_txt for tok in FB_CTA_TOKENS)
+
     from sales_agent.router import route_message as sales_route
+
+    if is_fb_cta:
+        synthetic_referral = {
+            "source_type": "fb_ad",
+            "source_id": "inferred_from_cta",
+            "headline": None,
+            "body": None,
+            "source_url": None,
+            "media_type": None,
+        }
+        handled = await sales_route(from_number, txt, referral=synthetic_referral)
+        if handled:
+            return
+
+    # Sales agent routing (check for active conversation)
     handled = await sales_route(from_number, txt)
     if handled:
         return
@@ -972,6 +997,27 @@ async def receive_message(request: Request):
                             handled = await sales_route_image(from_number, image_id, image_caption)
                             if not handled:
                                 logger.info(f"Image from {from_number} not handled by sales agent")
+
+                        elif msg_type == "audio":
+                            # Voice notes — download from Meta, transcribe, route as text.
+                            audio_data = message.get("audio", {})
+                            audio_id = audio_data.get("id", "")
+                            logger.info(f"Audio from {from_number}: id={audio_id}")
+                            await log_message("in", from_number, message_type="audio",
+                                              message_id=msg_id, extra={"audio_id": audio_id})
+                            try:
+                                from audio_handler import handle_audio, FALLBACK_MSG
+                                transcript = await handle_audio(from_number, audio_id)
+                                if transcript:
+                                    logger.info(f"Audio transcript from {from_number}: {transcript[:120]}")
+                                    # Inject referral for first-touch FB CTA-style audio
+                                    await process_text_message(from_number, transcript)
+                                else:
+                                    await send_whatsapp_message(from_number, FALLBACK_MSG)
+                            except Exception as e:
+                                logger.exception(f"audio handling failed for {from_number}: {e}")
+                                from audio_handler import FALLBACK_MSG
+                                await send_whatsapp_message(from_number, FALLBACK_MSG)
 
                         elif msg_type == "interactive":
                             interactive = message.get("interactive", {})
