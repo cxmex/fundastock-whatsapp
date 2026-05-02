@@ -652,8 +652,9 @@ async def _fetch_color_images_by_cid(estilo_id: int) -> dict[int, list[str]]:
                 f"{SUPABASE_URL}/rest/v1/image_uploads",
                 headers=SUPA_HEADERS,
                 params={
-                    "select": "public_url,color_id",
+                    "select": "public_url,color_id,display_order",
                     "estilo_id": f"eq.{estilo_id}",
+                    "order": "display_order.asc.nullslast,created_at.desc",
                     "limit": "200",
                 },
             )
